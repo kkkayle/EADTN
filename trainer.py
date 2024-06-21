@@ -9,6 +9,7 @@ import pandas as pd
 import os
 from torch import nn
 import torch.nn.functional as F
+import itertools
 class Trainer():
     def __init__(self,args) -> None:
         self.args=args
@@ -104,6 +105,17 @@ class Trainer():
         val_dataloader=DataLoader(val_dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=0,collate_fn=collate_fn, drop_last=True)
         
         return (train_dataloader,val_dataloader)
+    
+    def get_combined_val_dataloader(self):
+        val_datasets = []
+        for fold in range(5):
+            _, val_dataloader, _ = self.get_cluster_dataloader(fold)
+            val_datasets.append(val_dataloader.dataset)
+
+        combined_val_dataset = ConcatDataset(val_datasets)
+        combined_val_dataloader = DataLoader(combined_val_dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=0, collate_fn=cluster_collate_fn_normal_train, drop_last=True)
+
+        return combined_val_dataloader
     
     def fine_tuning(self,train_dataloader,fold):
         print('*'*10+'fine_tuning'+'*'*10)
@@ -250,48 +262,85 @@ class Trainer():
                 print(f'{key}:{value}')
     
     
-    
-       
-    def test_cluster_fine_tuning(self):
-        print('*'*10+'testing(fine_tuning)'+'*'*10)
-        output_list=[]
-        label_list=[]
+    def grid_search(self, val_dataloader, model_list, clusters_dict):
+        best_weights = None
+        best_score = float('-inf')
+        weight_combinations = list(itertools.product([0.1, 0.15, 0.2, 0.25, 0.3, 0.35], repeat=len(clusters_dict[0])))
+
+        
+        for weights in weight_combinations:
+            Y, S, P = [], [], []
+            with torch.no_grad():
+                for drugs, proteins, labels, clusters in tqdm(val_dataloader):
+                    drugs, proteins, labels = drugs.to(self.device), proteins.to(self.device), labels.to(self.device)
+                    out_sum = 0
+                    for index, model in enumerate(model_list):
+                        out = model(drugs, proteins)
+                        if index in clusters_dict[int(clusters)]:
+                            out *= weights[clusters_dict[int(clusters)].index(index)]
+                        else:
+                            out *= 0.1
+                        out_sum += out
+                    out_sum /= sum(weights) + 0.2
+                    Y.append(int(labels))
+                    S.append(out_sum.cpu().detach().numpy())
+            result = compute_metrics(Y, S)
+            score = result['desired_metric']  # Replace 'desired_metric' with the metric you are optimizing for
+            if score > best_score:
+                best_score = score
+                best_weights = weights
+
+        return best_weights
+
+    def test_cluster_fine_tuning(self,use_default_weights=True):
+        print('*' * 10 + 'testing(fine_tuning)' + '*' * 10)
+        output_list = []
+        label_list = []
         Y, P, S = [], [], []
-        test_dataset=DTIDataSet(self.test_data)
-        test_dataloader=DataLoader(test_dataset,batch_size=1,shuffle=False,num_workers=0,drop_last=True,collate_fn=cluster_collate_fn)
-        model_list=[]
-        clusters_dict={0:[0,3,4],1:[4,0,1],2:[0,1,2],3:[1,2,3],4:[2,3,4]}
-        for i in [f'./check_points/fine_tuning/{j}/valid_best_checkpoint.pth'for j in self.cluster_list]:
-        #for i in range(5):
-            model=EADTN(args=self.args)
-            #model.load_state_dict(torch.load(f'./check_points/{i}/valid_best_checkpoint.pth'))
+        test_dataset = DTIDataSet(self.test_data)
+        test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0, drop_last=True, collate_fn=cluster_collate_fn)
+        model_list = []
+        clusters_dict = {0: [0, 3, 4], 1: [4, 0, 1], 2: [0, 1, 2], 3: [1, 2, 3], 4: [2, 3, 4]}
+        
+        for i in [f'./check_points/fine_tuning/{j}/valid_best_checkpoint.pth' for j in self.cluster_list]:
+            model = EADTN(args=self.args)
             model.load_state_dict(torch.load(i))
             model.eval()
             model.to(self.device)
             model_list.append(model)
+        
+        combined_val_dataloader = self.get_combined_val_dataloader()
+        
+        if not use_default_weights:
+            best_weights = self.grid_search(combined_val_dataloader, model_list, clusters_dict)
+        else:
+            best_weights = [0.14, 0.14, 0.14]  # Default weights
+        
         with torch.no_grad():
-            for drugs,proteins,labels,clusters in tqdm(test_dataloader):
-                drugs,proteins,labels=drugs.to(self.device),proteins.to(self.device),labels.to(self.device)
+            for drugs, proteins, labels, clusters in tqdm(test_dataloader):
+                drugs, proteins, labels = drugs.to(self.device), proteins.to(self.device), labels.to(self.device)
                 label_list.append(int(labels))
-                out_sum=0
-                for index,model in enumerate(model_list):
-                    out=model(drugs,proteins)
+                out_sum = 0
+                for index, model in enumerate(model_list):
+                    out = model(drugs, proteins)
                     if index in clusters_dict[int(clusters)]:
-                        out*=0.14
+                        out *= best_weights[clusters_dict[int(clusters)].index(index)]
                     else:
-                        out*=0.1
-                    out_sum+=out
-                out_sum/=(0.14*3+0.2)
+                        out *= 0.1
+                    out_sum += out
+                out_sum /= sum(best_weights) + 0.2
                 output_list.append(out_sum.cpu().detach())
-        labels =np.array(label_list)
-        outputs = torch.nn.functional.softmax(torch.cat(output_list,dim=0), 1).to('cpu').data.numpy()
+        
+        labels = np.array(label_list)
+        outputs = torch.nn.functional.softmax(torch.cat(output_list, dim=0), 1).to('cpu').data.numpy()
         predictions = np.argmax(outputs, axis=1)
         outputs = outputs[:, 1]
         Y.extend(labels)
         P.extend(predictions)
         S.extend(outputs)
-        result=compute_metrics(Y, S, P)
-        for key,value in result.items():
-                print(f'{key}:{value}')
+        result = compute_metrics(Y, S, P)
+        for key, value in result.items():
+            print(f'{key}: {value}')
+
                 
                 
