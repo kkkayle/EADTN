@@ -112,7 +112,7 @@ class Trainer():
             _, val_dataloader, _ = self.get_cluster_dataloader(fold)
             val_datasets.append(val_dataloader.dataset)
 
-        combined_val_dataset = ConcatDataset(val_datasets)
+        combined_val_dataset = DTIDataSet(val_datasets)
         combined_val_dataloader = DataLoader(combined_val_dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=0, collate_fn=cluster_collate_fn_normal_train, drop_last=True)
 
         return combined_val_dataloader
